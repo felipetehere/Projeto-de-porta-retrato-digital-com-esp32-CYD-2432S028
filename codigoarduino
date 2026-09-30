@@ -1,0 +1,757 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <TJpg_Decoder.h>
+#include <LittleFS.h>
+#include <HTTPClient.h>
+#include <time.h>
+
+// ---------- CONFIGURACOES ----------
+
+struct Rede {
+  const char* ssid;
+  const char* pass;
+};
+
+// Redes tentadas em ordem de prioridade
+Rede redes[] = {
+  {"namewifi", "passwifi"},
+  {"namewifi", "passwifi"},
+  {"namewifi", "passwifi"},
+  {"namewifi", "passwifi"}
+};
+
+const int NUM_REDES = sizeof(redes) / sizeof(redes[0]);
+
+#define BOT_TOKEN "id do bot do telegram para mandar as fotos"
+#define CHAT_ID "id do telegram para mandar as foto"
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+TFT_eSPI tft = TFT_eSPI();
+
+#define W 320
+#define H 240
+#define BL 21
+
+// Brilho do backlight: 0 a 255 (menor = menos consumo e menos oscilacao)
+#define BRILHO 150
+
+// Compatibilidade com ESP32 core 2.x e 3.x
+void setBrilho(uint8_t v) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(BL, v);
+#else
+  ledcWrite(0, v);
+#endif
+}
+
+void initBrilho() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(BL, 5000, 8);
+#else
+  ledcSetup(0, 5000, 8);
+  ledcAttachPin(BL, 0);
+#endif
+  setBrilho(BRILHO);
+}
+
+const unsigned long TG_TIME = 4000;
+const unsigned long CLOCK_TIME = 30000;
+const unsigned long PHOTO_TIME = 120000;
+
+bool clockMode = true;
+bool showingClock = true;
+
+unsigned long lastTG = 0;
+unsigned long lastSlide = 0;
+unsigned long lastClock = 0;
+
+int photos = 0;
+int currentPhoto = 0;
+int oldDay = -1;
+int oldMinute = -1;
+
+// ---------- JPG DECODER ----------
+
+bool jpgOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* b) {
+  if (x >= W || y >= H) return false;
+  tft.pushImage(x, y, w, h, b);
+  return true;
+}
+
+// ---------- WIFI MULTIPLAS REDES ----------
+
+void wifiMsg(String l1, String l2, uint16_t cor) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(cor, TFT_BLACK);
+  tft.setTextFont(4);
+  tft.drawString(l1, W / 2, 95);
+  tft.drawString(l2, W / 2, 135);
+}
+
+bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+
+  for (int r = 0; r < NUM_REDES; r++) {
+    String nome = redes[r].ssid;
+
+    WiFi.disconnect(true);
+    delay(300);
+
+    // Conectando...
+    wifiMsg("Conectando ao WiFi", nome, TFT_WHITE);
+    Serial.println("Conectando a: " + nome);
+
+    WiFi.begin(redes[r].ssid, redes[r].pass);
+
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+      delay(500);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      // Sucesso
+      wifiMsg("Conectado a", nome, TFT_GREEN);
+      Serial.println("Conectado a " + nome);
+      Serial.println(WiFi.localIP());
+      delay(1500);
+      return true;
+    }
+
+    // Falha
+    wifiMsg("Rede " + nome, "nao conectada", TFT_RED);
+    Serial.println("Falha em: " + nome);
+    delay(1500);
+  }
+
+  // Nenhuma rede funcionou
+  wifiMsg("Sem WiFi", "Modo offline", TFT_YELLOW);
+  delay(1500);
+  return false;
+}
+
+// ---------- FOTOS ----------
+
+void countPhotos() {
+  photos = 0;
+
+  File root = LittleFS.open("/");
+  if (!root) return;
+
+  File f = root.openNextFile();
+
+  while (f) {
+    String n = f.name();
+    n.toLowerCase();
+
+    if (n.endsWith(".jpg") || n.endsWith(".jpeg"))
+      photos++;
+
+    f.close();
+    f = root.openNextFile();
+  }
+
+  root.close();
+
+  if (photos == 0 || currentPhoto >= photos)
+    currentPhoto = 0;
+}
+
+String photoName(int index) {
+  File root = LittleFS.open("/");
+  if (!root) return "";
+
+  int n = 0;
+  File f = root.openNextFile();
+
+  while (f) {
+    String p = f.name();
+    String x = p;
+    x.toLowerCase();
+
+    if (x.endsWith(".jpg") || x.endsWith(".jpeg")) {
+      if (n == index) {
+        f.close();
+        root.close();
+        return p;
+      }
+      n++;
+    }
+
+    f.close();
+    f = root.openNextFile();
+  }
+
+  root.close();
+  return "";
+}
+
+bool showPhoto() {
+  countPhotos();
+
+  if (!photos) return false;
+
+  String p = photoName(currentPhoto);
+  if (!p.length()) return false;
+
+  tft.fillScreen(TFT_BLACK);
+
+  if (!p.startsWith("/")) p = "/" + p;
+  TJpgDec.drawFsJpg(0, 0, p, LittleFS);
+
+  currentPhoto++;
+
+  if (currentPhoto >= photos)
+    currentPhoto = 0;
+
+  return true;
+}
+
+// ---------- RELOGIO ----------
+
+void showClock() {
+  struct tm t;
+
+  if (!getLocalTime(&t, 500))
+    return;
+
+  char h[8];
+  char d[15];
+
+  strftime(h, sizeof(h), "%H:%M", &t);
+  strftime(d, sizeof(d), "%d/%m/%Y", &t);
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  tft.setTextFont(4);
+  tft.drawString(h, W / 2, 70);
+  tft.drawString(d, W / 2, 115);
+
+  tft.setTextFont(2);
+  tft.drawString("titulo ao iniciar e abaixo do relogio", W / 2, 165);
+  tft.drawString("titulo ao iniciar e abaixo do relogio", W / 2, 195);
+
+  oldDay = t.tm_mday;
+  oldMinute = t.tm_min;
+}
+
+void updateClock() {
+  struct tm t;
+
+  if (!getLocalTime(&t, 100))
+    return;
+
+  // Mudou o dia: redesenha tudo
+  if (t.tm_mday != oldDay) {
+    showClock();
+    return;
+  }
+
+  // Mesmo minuto: nao faz nada (evita piscar)
+  if (t.tm_min == oldMinute)
+    return;
+
+  oldMinute = t.tm_min;
+
+  char h[8];
+  strftime(h, sizeof(h), "%H:%M", &t);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextFont(4);
+  tft.setTextPadding(120);   // apaga o texto antigo sem fillRect
+  tft.drawString(h, W / 2, 70);
+  tft.setTextPadding(0);
+}
+
+// ---------- CARROSSEL ----------
+
+void startCarousel() {
+  countPhotos();
+
+  if (!photos) {
+    clockMode = true;
+    showingClock = true;
+    showClock();
+    return;
+  }
+
+  clockMode = false;
+  showingClock = true;
+  currentPhoto = 0;
+
+  showClock();
+
+  lastSlide = millis();
+  lastClock = millis();
+
+  Serial.printf("Carrossel: %d fotos\n", photos);
+}
+
+// ---------- LIMPAR FOTOS ----------
+
+void clearPhotos() {
+  String files[100];
+  int total = 0;
+
+  File root = LittleFS.open("/");
+
+  if (!root) return;
+
+  File f = root.openNextFile();
+
+  while (f && total < 100) {
+    String p = f.name();
+    String x = p;
+    x.toLowerCase();
+
+    if (x.endsWith(".jpg") || x.endsWith(".jpeg")) {
+      files[total++] = p;
+    }
+
+    f.close();
+    f = root.openNextFile();
+  }
+
+  root.close();
+
+  for (int i = 0; i < total; i++) {
+    Serial.print("Apagando: ");
+    Serial.println(files[i]);
+
+    String path = files[i];
+    if (!path.startsWith("/")) path = "/" + path;
+    LittleFS.remove(path);
+  }
+
+  photos = 0;
+  currentPhoto = 0;
+  clockMode = true;
+  showingClock = true;
+
+  countPhotos();
+  showClock();
+
+  Serial.printf("Fotos restantes: %d\n", photos);
+}
+
+// ---------- DOWNLOAD DIRETO ----------
+
+bool downloadPhotoFromUrl(String fullUrl, String save) {
+  HTTPClient http;
+
+  Serial.println("Baixando de:");
+  Serial.println(fullUrl);
+
+  http.begin(fullUrl);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(20000);
+
+  int code = http.GET();
+
+  Serial.print("HTTP: ");
+  Serial.println(code);
+
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  File f = LittleFS.open(save, FILE_WRITE);
+
+  if (!f) {
+    Serial.println("Erro ao criar arquivo.");
+    http.end();
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+
+  uint8_t buffer[1024];
+  int total = 0;
+
+  unsigned long timeout = millis();
+
+  while (http.connected()) {
+    size_t available = stream->available();
+
+    if (available) {
+      if (available > sizeof(buffer))
+        available = sizeof(buffer);
+
+      int len = stream->readBytes(buffer, available);
+
+      if (len > 0) {
+        f.write(buffer, len);
+        total += len;
+        timeout = millis();
+      }
+    }
+
+    if (millis() - timeout > 10000)
+      break;
+
+    yield();
+  }
+
+  f.close();
+  http.end();
+
+  Serial.print("Bytes recebidos: ");
+  Serial.println(total);
+
+  if (total <= 0) {
+    LittleFS.remove(save);
+    return false;
+  }
+
+  return true;
+}
+
+// ---------- TELEGRAM HELPER ----------
+
+void sendHelp(String chat) {
+  bot.sendMessage(chat,
+    "Ola, Felipe! O ESP esta em operacao.\n\n"
+    "Envie uma foto para armazenar na memoria interna.\n\n"
+    "/start - Comandos\n"
+    "/carrossel - Inicia o carrossel\n"
+    "/relogio - Somente relogio\n"
+    "/limpar - Apaga fotos\n"
+    "/fotos - Quantidade de fotos\n"
+    "/status - Memoria e status",
+    "");
+}
+
+void sendStatus(String chat) {
+  countPhotos();
+
+  uint32_t total = LittleFS.totalBytes();
+  uint32_t used = LittleFS.usedBytes();
+  uint32_t free = total - used;
+
+  String s = "STATUS DO ESP32\n\n";
+
+  s += "Fotos: " + String(photos) + "\n";
+  s += "Memoria total: " + String(total / 1024) + " KB\n";
+  s += "Memoria usada: " + String(used / 1024) + " KB\n";
+  s += "Memoria disponivel: " + String(free / 1024) + " KB\n\n";
+
+  s += "Wi-Fi: ";
+  if (WiFi.status() == WL_CONNECTED) {
+    s += "Conectado a " + WiFi.SSID() + "\n";
+  } else {
+    s += "Desconectado\n";
+  }
+
+  s += "Modo: ";
+  if (clockMode)
+    s += "Relogio";
+  else if (showingClock)
+    s += "Carrossel - Relogio";
+  else
+    s += "Carrossel - Foto";
+
+  bot.sendMessage(chat, s, "");
+}
+
+// ---------- MENSAGENS ----------
+
+void messages(int n) {
+
+  for (int i = 0; i < n; i++) {
+
+    String chat = bot.messages[i].chat_id;
+
+    if (chat != CHAT_ID)
+      continue;
+
+    String text = bot.messages[i].text;
+
+    // ---------- FOTO ----------
+
+    if (bot.messages[i].type == "photo") {
+
+      Serial.println("FOTO RECEBIDA PELO TELEGRAM");
+
+      // Baixa os updates puros via API para nao depender da struct da lib
+      String urlGet = "https://api.telegram.org/bot" + String(BOT_TOKEN) + "/getUpdates?offset=" + String(bot.last_message_received);
+
+      HTTPClient http;
+      http.begin(urlGet);
+      int httpCode = http.GET();
+      String filePath = "";
+
+      if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        DynamicJsonDocument doc(4096);
+        deserializeJson(doc, payload);
+
+        JsonArray result = doc["result"].as<JsonArray>();
+        if (result.size() > 0) {
+          JsonArray photoArray = result[0]["message"]["photo"].as<JsonArray>();
+          if (photoArray.size() > 0) {
+            String fileId = photoArray[photoArray.size() - 1]["file_id"].as<String>();
+
+            // Busca o caminho do arquivo
+            HTTPClient httpFile;
+            httpFile.begin("https://api.telegram.org/bot" + String(BOT_TOKEN) + "/getFile?file_id=" + fileId);
+            if (httpFile.GET() == HTTP_CODE_OK) {
+              DynamicJsonDocument docFile(1024);
+              deserializeJson(docFile, httpFile.getString());
+              filePath = docFile["result"]["file_path"].as<String>();
+            }
+            httpFile.end();
+          }
+        }
+      }
+      http.end();
+
+      if (filePath.length() == 0) {
+        bot.sendMessage(chat, "Erro ao obter foto do Telegram.", "");
+        Serial.println("Erro ao processar JSON da foto.");
+        continue;
+      }
+
+      String downloadUrl = "https://api.telegram.org/file/bot" + String(BOT_TOKEN) + "/" + filePath;
+      String save = "/img_" + String(millis()) + ".jpg";
+
+      // Baixa para o LittleFS
+      if (downloadPhotoFromUrl(downloadUrl, save)) {
+
+        countPhotos();
+
+        Serial.print("Foto salva: ");
+        Serial.println(save);
+
+        clockMode = false;
+        showingClock = false;
+
+        currentPhoto = photos - 1;
+
+        String p = photoName(currentPhoto);
+
+        tft.fillScreen(TFT_BLACK);
+
+        if (p.length()) {
+          if (!p.startsWith("/")) p = "/" + p;
+          TJpgDec.drawFsJpg(0, 0, p, LittleFS);
+        }
+
+        currentPhoto++;
+
+        if (currentPhoto >= photos)
+          currentPhoto = 0;
+
+        lastSlide = millis();
+        lastClock = millis();
+
+        bot.sendMessage(chat, "Foto armazenada com sucesso!\nTotal de fotos: " + String(photos), "");
+
+      } else {
+        bot.sendMessage(chat, "Nao foi possivel salvar a foto.", "");
+        Serial.println("ERRO AO BAIXAR FOTO");
+      }
+
+      continue;
+    }
+
+    // ---------- COMANDOS ----------
+
+    if (text == "/start") {
+      sendHelp(chat);
+    }
+    else if (text == "/carrossel") {
+      startCarousel();
+
+      bot.sendMessage(chat,
+        "Carrossel iniciado.\n"
+        "Relogio: 30 segundos\n"
+        "Foto: 2 minutos\n"
+        "Fotos: " + String(photos),
+        "");
+    }
+    else if (text == "/relogio") {
+      clockMode = true;
+      showingClock = true;
+
+      showClock();
+
+      bot.sendMessage(chat, "Modo relogio ativado.", "");
+    }
+    else if (text == "/limpar") {
+      clearPhotos();
+
+      bot.sendMessage(chat,
+        "Fotos apagadas!\n"
+        "Fotos restantes: " + String(photos),
+        "");
+    }
+    else if (text == "/fotos") {
+      countPhotos();
+
+      bot.sendMessage(chat, "Fotos armazenadas: " + String(photos), "");
+    }
+    else if (text == "/status") {
+      sendStatus(chat);
+    }
+  }
+}
+
+// ---------- INICIALIZACAO ----------
+
+void startup() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  tft.setTextFont(4);
+  tft.drawString("PORTA RETRATO", W / 2, 65);
+  tft.drawString("DIGITAL", W / 2, 105);
+
+  tft.setTextFont(2);
+  tft.drawString("Te amo meu amor", W / 2, 150);
+  tft.drawString("Feito por Felipe", W / 2, 180);
+
+  for (int i = 0; i < 3; i++) {
+    tft.drawString("Carregando...", W / 2, 215);
+    delay(500);
+    tft.fillRect(70, 200, 180, 30, TFT_BLACK);
+    delay(300);
+  }
+}
+
+// ---------- SETUP ----------
+
+void setup() {
+  Serial.begin(115200);
+
+  initBrilho();
+
+  tft.init();
+  tft.setRotation(1);
+  tft.setSwapBytes(true);
+
+  TJpgDec.setCallback(jpgOutput);
+  TJpgDec.setJpgScale(1);
+
+  if (!LittleFS.begin(true)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("ERRO LITTLEFS", W / 2, 120);
+
+    while (true)
+      delay(1000);
+  }
+
+  startup();
+
+  // Wi-Fi (varias redes)
+  connectWiFi();
+
+  // Reduz picos de corrente do WiFi (se o sinal ficar fraco, use WIFI_POWER_15dBm)
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+
+  client.setInsecure();
+
+  // Hora
+  configTime(-3 * 3600, 0, "pool.ntp.org");
+
+  struct tm t;
+  for (int i = 0; i < 20; i++) {
+    if (getLocalTime(&t, 500))
+      break;
+    delay(500);
+  }
+
+  // Fotos
+  countPhotos();
+
+  Serial.print("Fotos encontradas na memoria: ");
+  Serial.println(photos);
+
+  if (photos > 0) {
+    clockMode = false;
+    showingClock = true;
+    currentPhoto = 0;
+
+    showClock();
+
+    lastSlide = millis();
+    lastClock = millis();
+
+    Serial.println("CARROSSEL AUTOMATICO ATIVO");
+
+  } else {
+    clockMode = true;
+    showingClock = true;
+
+    showClock();
+
+    Serial.println("NENHUMA FOTO ENCONTRADA");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    delay(2000);
+    sendHelp(CHAT_ID);
+  }
+}
+
+// ---------- LOOP ----------
+
+void loop() {
+
+  // Telegram
+  if (millis() - lastTG >= TG_TIME) {
+    lastTG = millis();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      int n = bot.getUpdates(bot.last_message_received + 1);
+
+      while (n) {
+        messages(n);
+        n = bot.getUpdates(bot.last_message_received + 1);
+      }
+    }
+  }
+
+  // Atualiza relogio
+  if (millis() - lastClock >= 1000) {
+    lastClock = millis();
+
+    if (clockMode || showingClock)
+      updateClock();
+  }
+
+  // Carrossel
+  if (!clockMode && photos > 0) {
+
+    // Relogio -> Foto
+    if (showingClock && millis() - lastSlide >= CLOCK_TIME) {
+      if (showPhoto()) {
+        showingClock = false;
+        lastSlide = millis();
+
+        Serial.println("Relogio -> Foto");
+      }
+    }
+
+    // Foto -> Relogio
+    else if (!showingClock && millis() - lastSlide >= PHOTO_TIME) {
+      showingClock = true;
+      lastSlide = millis();
+
+      showClock();
+
+      Serial.println("Foto -> Relogio");
+    }
+  }
+
+  yield();
+}
