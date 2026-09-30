@@ -1,5 +1,7 @@
 Eae? como vai seu dia hj? BR
 
+O projeto e simples e um carrosel de fotos onde o relogio com data e hora fica por 30 seg e as fotos vao de 2 em 2 min, ele se conecta ao wifi para atualizar as horas e para mandar as fotos atravez do bot do telegram nao precisa de cartao de momorias as fotos sao armazenadas direto no esp32 - 2432s028 com tela caso nao tenha wifi ele fica offline mas passando as foto na memoria
+
 no visual studio voce tem que alterar algumas coisa
 
 ctrl + f
